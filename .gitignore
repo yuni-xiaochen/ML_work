@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+results/
+household_power_consumption.txt
+MENSQ_92_previous-1950-2024.csv
