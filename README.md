@@ -13,8 +13,19 @@
    - 包含有功功率、无功功率、电压、电流、各子表能耗
 
 2. **气象数据** - [Météo-France 月度气候数据](https://www.data.gouv.fr/fr/datasets/donnees-climatologiques-de-base-mensuelles)
-   - 选用 BAGNEUX 站（距 Sceaux 最近）
-   - 包含月降水量、降水天数、雾天数等特征
+   - 选用 BAGNEUX 站（站号92007001）和 MEUDON 站（站号92048001）
+   - 包含月降水量（RR）、降水天数（NBJRR1/5/10）、雾天数（NBJBROU）
+
+### 特征工程
+
+| 类别 | 特征 | 数量 |
+|------|------|:---:|
+| 电力变量 | Global\_reactive\_power, Voltage, Global\_intensity, Sub\_metering\_1/2/3, Sub\_metering\_remainder | 7 |
+| 气象变量 | RR, NBJRR1, NBJRR5, NBJRR10, NBJBROU | 5 |
+| 时间编码 | sin/cos(day\_of\_year), sin/cos(day\_of\_week) | 4 |
+| 目标滞后 | Global\_active\_power lag\_1d/2d/3d/7d/14d/30d | 6 |
+| 滚动统计 | roll\_mean\_7d/14d/30d, roll\_std\_7d/14d/30d | 6 |
+| **合计** | | **28** |
 
 ### 预测任务
 
@@ -25,28 +36,40 @@
 
 ## 模型
 
-| 模型 | 参数量 | 说明 |
-|------|--------|------|
-| **LSTM Seq2Seq** | ~505K | 编码器-解码器 LSTM + Luong Attention |
-| **Transformer** | ~996K | 标准 Transformer 编码器-解码器 |
-| **CNN-Transformer** | ~550K | 多尺度 1D-CNN + Transformer 编码器 + MLP 解码 |
+| 模型 | 参数量 | 编码器 | 解码器 |
+|------|:------:|--------|--------|
+| **LSTM Seq2Seq + Attention** | ~3.06M | 3层单向 LSTM（hidden=256） | LSTM 自回归 + Luong Attention |
+| **Transformer** | ~2.62M | 4层 TransformerEncoder（d\_model=256, 8head） | MLP 一次性输出（非自回归） |
+| **CNN-Transformer** ✨ | ~2.67M | 多尺度 1D-CNN → 4层 TransformerEncoder | MLP 一次性输出（非自回归） |
 
-### 改进模型（CNN-Transformer）创新点
+### 训练策略
 
-- 使用三个平行 1D 卷积（kernel_size=3, 5, 7）提取多尺度局部时序特征
-- Transformer 编码器建模长程依赖关系
-- 直接 MLP 解码（非自回归），减少误差累积
+| 配置项 | 值 |
+|------|-----|
+| 优化器 | AdamW（lr=5e-4, weight\_decay=1e-5） |
+| 学习率调度 | CosineAnnealingWarmRestarts（T₀=30, T\_mult=2） |
+| 损失函数 | Huber Loss（δ=1.0） |
+| 批量大小 | 64 |
+| 最大轮数 / 早停 | 300 / patience=50 |
+| 混合精度 | AMP（GradScaler） |
+| 设备 | NVIDIA RTX 5090（31.4 GB） |
 
 ## 项目结构
 
 ```
-├── data_processing.py    # 数据加载、清洗、特征工程
-├── models.py             # LSTM / Transformer / CNN-Transformer 模型
-├── train_evaluate.py     # 训练循环与评估
-├── main.py               # 主入口
-├── requirements.txt      # 依赖
-├── README.md             # 本文件
-└── results/              # 实验结果输出目录
+├── data_processing.py     # 数据加载、清洗、特征工程（日聚合/天气融合/滞后+滚动特征）
+├── models.py              # LSTM / Transformer / CNN-Transformer 模型定义
+├── train_evaluate.py      # 训练循环（AMP混合精度）与评估
+├── main.py                # 主入口
+├── report.tex             # 实验报告（LaTeX）
+├── requirements.txt       # 依赖
+└── results/               # 实验结果输出目录
+    └── <timestamp>/       # 每次运行的结果
+        ├── report.txt     # 文字报告（MSE/MAE/退化分析）
+        ├── results_*.csv  # 汇总结果
+        ├── predictions_*  # 预测值 CSV + 曲线图
+        ├── comparison_*   # 模型对比图
+        └── train.csv / test.csv
 ```
 
 ## 使用方法
@@ -87,8 +110,8 @@ python main.py --mode single --model lstm --output_len 90
 | `--mode` | full | 运行模式：full/quick/short/long/single |
 | `--model` | lstm | 模型名称：lstm/transformer/cnn_transformer |
 | `--output_len` | 90 | 输出序列长度 |
-| `--epochs` | 200 | 最大训练轮数 |
-| `--batch_size` | 32 | 批量大小 |
+| `--epochs` | 300 | 最大训练轮数 |
+| `--batch_size` | 64 | 批量大小 |
 
 ## 评估指标
 
