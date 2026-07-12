@@ -130,6 +130,150 @@ def save_results(summaries, output_dir, mode_name):
     print(f"  结果已保存: {csv_path}")
 
 
+# ============================================================
+# 文字报告生成（无需看图）
+# ============================================================
+
+def save_prediction_csv(targets, predictions, model_name, horizon, output_dir):
+    """保存预测样本的原始数值到 CSV"""
+    n_samples = min(5, len(targets))
+    indices = np.linspace(0, len(targets) - 1, n_samples, dtype=int)
+
+    rows = []
+    for i, idx in enumerate(indices):
+        tgt = targets[idx]
+        pred = predictions[idx]
+        for day in range(len(tgt)):
+            rows.append({
+                'Sample': f'sample_{i+1}',
+                'Day': day + 1,
+                'Ground_Truth': round(float(tgt[day]), 6),
+                'Prediction': round(float(pred[day]), 6),
+                'Error': round(float(pred[day] - tgt[day]), 6),
+                'Abs_Error': round(float(abs(pred[day] - tgt[day])), 6),
+            })
+
+    df = pd.DataFrame(rows)
+    csv_path = os.path.join(output_dir, f'predictions_{model_name}_{horizon}.csv')
+    df.to_csv(csv_path, index=False)
+    print(f"  预测数值已保存: {csv_path}")
+
+    # 每个样本的汇总
+    for i, idx in enumerate(indices):
+        tgt = targets[idx]
+        pred = predictions[idx]
+        mse = np.mean((tgt - pred) ** 2)
+        mae = np.mean(np.abs(tgt - pred))
+        # 分段误差（前30天 vs 全部）
+        seg = min(30, len(tgt))
+        mae_30 = np.mean(np.abs(tgt[:seg] - pred[:seg]))
+        mae_tail = np.mean(np.abs(tgt[seg:] - pred[seg:])) if len(tgt) > seg else 0
+        print(f"  Sample {i+1}: MSE={mse:.6f}, MAE={mae:.6f}, "
+              f"MAE_1-{seg}={mae_30:.6f}, MAE_{seg+1}-{len(tgt)}={mae_tail:.6f}")
+
+    return n_samples
+
+
+def generate_text_report(all_summaries, output_dir):
+    """生成完整的文字报告，供 LLM 分析"""
+    lines = []
+    lines.append("=" * 70)
+    lines.append("家庭电力消耗预测 — 实验报告")
+    lines.append("=" * 70)
+
+    # 数据概览
+    short_summaries = [s for s in all_summaries if s['output_len'] == 90]
+    long_summaries = [s for s in all_summaries if s['output_len'] == 365]
+
+    # ---- 短期预测 ----
+    if short_summaries:
+        lines.append("\n" + "-" * 50)
+        lines.append("【短期预测】输入90天 → 输出90天")
+        lines.append("-" * 50)
+        lines.append(f"{'模型':<20} {'MSE':>10} {'MSE±std':>14} {'MAE':>10} {'MAE±std':>14} {'训练轮数':>8}")
+        lines.append("-" * 70)
+
+        for s in sorted(short_summaries, key=lambda x: x['mse_mean']):
+            best_result = s['best_result']
+            epochs_trained = best_result.get('epochs_trained', '?')
+            train_time = best_result.get('time', 0)
+            n_params = sum(p.numel() for p in best_result['model'].parameters()
+                          if p.requires_grad)
+            lines.append(
+                f"{s['model_name']:<20} "
+                f"{s['mse_mean']:10.6f} "
+                f"{s['mse_std']:>14.6f} "
+                f"{s['mae_mean']:10.6f} "
+                f"{s['mae_std']:>14.6f} "
+                f"{epochs_trained:>8}"
+            )
+            lines.append(f"  → 参数量: {n_params:,} | 训练用时: {train_time:.0f}s | "
+                        f"各轮MSE: {[f'{v:.4f}' for v in s['mse_values']]}")
+            lines.append(f"  → 各轮MAE: {[f'{v:.4f}' for v in s['mae_values']]}")
+
+        # 排名
+        lines.append("\n短期预测排名 (MSE):")
+        for rank, s in enumerate(sorted(short_summaries, key=lambda x: x['mse_mean'])):
+            lines.append(f"  {rank+1}. {s['model_name']}: MSE={s['mse_mean']:.6f} ± {s['mse_std']:.6f}")
+
+    # ---- 长期预测 ----
+    if long_summaries:
+        lines.append("\n" + "-" * 50)
+        lines.append("【长期预测】输入90天 → 输出365天")
+        lines.append("-" * 50)
+        lines.append(f"{'模型':<20} {'MSE':>10} {'MSE±std':>14} {'MAE':>10} {'MAE±std':>14} {'训练轮数':>8}")
+        lines.append("-" * 70)
+
+        for s in sorted(long_summaries, key=lambda x: x['mse_mean']):
+            best_result = s['best_result']
+            epochs_trained = best_result.get('epochs_trained', '?')
+            train_time = best_result.get('time', 0)
+            n_params = sum(p.numel() for p in best_result['model'].parameters()
+                          if p.requires_grad)
+            lines.append(
+                f"{s['model_name']:<20} "
+                f"{s['mse_mean']:10.6f} "
+                f"{s['mse_std']:>14.6f} "
+                f"{s['mae_mean']:10.6f} "
+                f"{s['mae_std']:>14.6f} "
+                f"{epochs_trained:>8}"
+            )
+            lines.append(f"  → 参数量: {n_params:,} | 训练用时: {train_time:.0f}s | "
+                        f"各轮MSE: {[f'{v:.4f}' for v in s['mse_values']]}")
+            lines.append(f"  → 各轮MAE: {[f'{v:.4f}' for v in s['mae_values']]}")
+
+        lines.append("\n长期预测排名 (MSE):")
+        for rank, s in enumerate(sorted(long_summaries, key=lambda x: x['mse_mean'])):
+            lines.append(f"  {rank+1}. {s['model_name']}: MSE={s['mse_mean']:.6f} ± {s['mse_std']:.6f}")
+
+    # ---- 跨模型对比 ----
+    lines.append("\n" + "-" * 50)
+    lines.append("【短期→长期退化分析】")
+    lines.append("-" * 50)
+    lines.append(f"{'模型':<20} {'短期MSE':>10} {'长期MSE':>10} {'退化倍数':>10}")
+    lines.append("-" * 52)
+
+    model_names = sorted(set(s['model_name'] for s in all_summaries))
+    for name in model_names:
+        short = next((s for s in short_summaries if s['model_name'] == name), None)
+        long = next((s for s in long_summaries if s['model_name'] == name), None)
+        if short and long:
+            ratio = long['mse_mean'] / max(short['mse_mean'], 1e-10)
+            lines.append(f"{name:<20} {short['mse_mean']:10.6f} {long['mse_mean']:10.6f} {ratio:>10.2f}x")
+
+    report = '\n'.join(lines)
+
+    # 写入文件
+    report_path = os.path.join(output_dir, 'report.txt')
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(report)
+
+    print(f"\n文字报告已保存: {report_path}")
+    print(report)
+
+    return report_path
+
+
 def main():
     parser = argparse.ArgumentParser(description='家庭电力消耗预测')
     parser.add_argument('--mode', type=str, default='full',
@@ -140,9 +284,9 @@ def main():
                         help='单模型测试时指定模型')
     parser.add_argument('--output_len', type=int, default=90,
                         help='输出序列长度（单模型测试时使用）')
-    parser.add_argument('--epochs', type=int, default=200,
+    parser.add_argument('--epochs', type=int, default=300,
                         help='最大训练轮数')
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=64,
                         help='批量大小')
     args = parser.parse_args()
 
@@ -251,8 +395,15 @@ def main():
 
         all_summaries.append(summary)
 
-        # 绘制最佳模型的预测曲线
+        # 保存预测数值 CSV
         best_result = summary['best_result']
+        save_prediction_csv(
+            best_result['targets'],
+            best_result['predictions'],
+            model_name, horizon, output_dir
+        )
+
+        # 绘制最佳模型的预测曲线
         plot_predictions(
             best_result['targets'],
             best_result['predictions'],
@@ -281,16 +432,8 @@ def main():
     # 保存所有结果
     save_results(all_summaries, output_dir, 'all')
 
-    # 打印最终汇总
-    print("\n" + "="*60)
-    print("最终结果汇总")
-    print("="*60)
-    for s in all_summaries:
-        print(f"\n{s['model_name'].upper()} (output_len={s['output_len']}):")
-        print(f"  MSE: {s['mse_mean']:.4f} ± {s['mse_std']:.4f}")
-        print(f"  MAE: {s['mae_mean']:.4f} ± {s['mae_std']:.4f}")
-        print(f"  各轮MSE: {[f'{v:.4f}' for v in s['mse_values']]}")
-        print(f"  各轮MAE: {[f'{v:.4f}' for v in s['mae_values']]}")
+    # 生成文字报告（无需看图）
+    generate_text_report(all_summaries, output_dir)
 
     print(f"\n所有结果已保存到: {output_dir}")
     return all_summaries, data

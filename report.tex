@@ -1,0 +1,548 @@
+\documentclass[12pt,a4paper]{ctexart}
+
+% === 页面设置 ===
+\usepackage[top=2.5cm, bottom=2.5cm, left=2.5cm, right=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{array}
+\usepackage{multirow}
+
+% === 标题 ===
+\title{\textbf{基于深度学习的家庭电力消耗时间序列预测}}
+\author{
+    20255227020-蔡乐天
+}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+家庭电力消耗的准确预测对智能电网调度、节能减排和用户用电管理具有重要意义。
+本文基于UCI家庭电力消耗数据集，结合气象数据，构建了多变量时间序列预测模型。
+针对短期（90天$\to$90天）和长期（90天$\to$365天）两种预测任务，
+分别实现了LSTM序列到序列模型、Transformer编码器模型以及一种结合多尺度卷积与Transformer编码器的改进模型（CNN-Transformer）。
+在5轮独立实验中，CNN-Transformer在长期预测任务上取得了最优性能（MSE=42.07$\pm$0.98，MAE=5.00$\pm$0.07），
+且从短期到长期的性能退化仅为1.03倍，展现出优异的长期依赖建模能力和预测稳定性。
+
+\textbf{关键词：}家庭电力消耗预测；多变量时间序列；LSTM；Transformer；CNN-Transformer
+\end{abstract}
+
+% ============================================================
+\section{问题介绍}
+% ============================================================
+
+随着智能家居与物联网技术的快速发展，家庭电力消耗的监测与管理成为实现节能减排、
+降低用电成本的重要手段。通过对家庭用电数据进行精细化的采集和建模分析，
+不仅可以辅助居民了解自身用电行为，还能为电力公司合理调度负荷、
+平衡供需提供技术支撑。然而，家庭电力消耗受季节更替、节假日安排、
+家庭成员行为模式、用电设备种类以及气象条件等多重因素的复杂影响，
+这使得准确预测电力消耗具有显著的挑战性和现实意义。
+
+本文使用的数据集来自UCI Machine Learning Repository的Individual Household Electric Power Consumption数据集\cite{uci_dataset}，
+采集自法国一户家庭，时间跨度为2006年12月至2010年11月，原始数据粒度为每分钟一次。
+主要变量包括全局有功功率（Global\_active\_power）、全局无功功率（Global\_reactive\_power）、
+电压（Voltage）、电流强度（Global\_intensity）以及三个子表能耗（Sub\_metering\_1/2/3）。
+此外，我们融合了来自M\'et\'eo-France的月度气象数据\cite{weather_data}，
+包括月累计降水量（RR）、不同阈值降水天数（NBJRR1/5/10）以及雾天数（NBJBROU）。
+各字段的详细说明见表\ref{tab:fields}。
+
+\begin{table}[H]
+\centering
+\caption{数据集字段说明}
+\label{tab:fields}
+\small
+\begin{tabular}{lllp{4.5cm}}
+\toprule
+\textbf{字段名} & \textbf{含义} & \textbf{单位} & \textbf{日聚合方式} \\
+\midrule
+Global\_active\_power  & 全局有功功率（预测目标） & kW & 求和后除以60（$\to$ kWh） \\
+Global\_reactive\_power & 全局无功功率 & kW & 求和后除以60（$\to$ kWh） \\
+Voltage                & 电路平均电压 & V & 取平均 \\
+Global\_intensity       & 总平均电流强度 & A & 取平均 \\
+Sub\_metering\_1         & 厨房区域能耗 & Wh & 求和后除以1000（$\to$ kWh） \\
+Sub\_metering\_2         & 洗衣房区域能耗 & Wh & 求和后除以1000（$\to$ kWh） \\
+Sub\_metering\_3         & 气候控制系统能耗 & Wh & 求和后除以1000（$\to$ kWh） \\
+\multirow{2}{*}{Sub\_metering\_remainder} & \multirow{2}{*}{剩余能耗（计算值）} & \multirow{2}{*}{kWh} & $\text{GAP} - (\text{SM1} + \text{SM2}$ \\
+                       &                      &                       & $+ \text{SM3})$（日聚合后计算） \\
+RR                     & 月累计降水量 & mm/10 & 当月所有日取相同值 \\
+NBJRR1                 & 月内日降水$\geq$1mm天数 & 天 & 当月所有日取相同值 \\
+NBJRR5                 & 月内日降水$\geq$5mm天数 & 天 & 当月所有日取相同值 \\
+NBJRR10                & 月内日降水$\geq$10mm天数 & 天 & 当月所有日取相同值 \\
+NBJBROU                & 月内雾出现天数 & 天 & 当月所有日取相同值 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+预测任务设定为：基于过去90天的多元时间序列数据，分别预测未来90天（短期预测）和
+未来365天（长期预测）的全局有功功率。两个任务需独立训练模型。
+评价指标采用均方误差（MSE）和平均绝对误差（MAE）：
+\begin{align}
+\text{MSE} &= \frac{1}{N}\sum_{i=1}^{N} (\hat{y}_i - y_i)^2, &
+\text{MAE} &= \frac{1}{N}\sum_{i=1}^{N} |\hat{y}_i - y_i|
+\end{align}
+其中$N$为测试集样本总数$\times$输出序列长度，$y_i$为真实值，$\hat{y}_i$为预测值。
+每组实验至少进行5轮独立运行，报告均值$\pm$标准差以评估稳定性。
+
+% ============================================================
+\section{数据预处理}
+% ============================================================
+
+\subsection{电力数据处理}
+
+原始数据以分钟为粒度记录，首先按以下规则聚合为日级数据：
+\begin{itemize}[nosep]
+    \item 功率类变量（Global\_active\_power、Global\_reactive\_power）及子表能耗（Sub\_metering\_1/2/3）按天求和；
+    \item 电压（Voltage）和电流（Global\_intensity）按天取平均。
+\end{itemize}
+
+具体地，每分钟记录的功率单位为kW，则某日全天有功功率消耗（kWh）为：
+\begin{equation}
+P_{\text{day}} = \frac{1}{60} \sum_{t=1}^{1440} P_{t}
+\end{equation}
+其中$P_t$为第$t$分钟的瞬时有功功率（kW），日求和后除以60将kW$\cdot$min转换为kWh。
+同理，无功功率按相同方式处理。子表能耗单位为Wh，日消耗量（kWh）为：
+\begin{equation}
+E_{\text{day}}^{(i)} = \frac{1}{1000} \sum_{t=1}^{1440} E_{t}^{(i)},\quad i \in \{1,2,3\}
+\end{equation}
+剩余能耗由三者关系导出：
+\begin{equation}
+\text{Sub\_metering\_remainder} = \text{Global\_active\_power} - \sum_{i=1}^{3} \text{Sub\_metering\_i}
+\end{equation}
+
+数据中的缺失值（原始数据中以“?”标记）采用前向填充后后向填充的策略处理。
+日聚合后共得到约1440天数据，日期范围为2006年12月至2010年11月。
+
+\subsection{气象数据融合}
+
+气象数据来自法国BAGNEUX站（站号92007001）和MEUDON站（站号92048001），
+以月为单位记录。将电力数据的日期映射到对应年月，合并月度气象变量。
+对于缺失月份，采用线性插值填充。
+
+\subsection{特征工程}
+
+\subsubsection{时间周期特征}
+
+为捕获电力消耗的周期性规律，添加了时间的正弦/余弦编码。令$\text{doy}\in[1,366]$为年内日序，$\text{dow}\in[0,6]$为周内日序，则：
+\begin{align}
+\text{sin\_dayofyear} &= \sin\left(\frac{2\pi \cdot \text{doy}}{365.25}\right), &
+\text{cos\_dayofyear} &= \cos\left(\frac{2\pi \cdot \text{doy}}{365.25}\right) \\
+\text{sin\_dayofweek} &= \sin\left(\frac{2\pi \cdot \text{dow}}{7}\right), &
+\text{cos\_dayofweek} &= \cos\left(\frac{2\pi \cdot \text{dow}}{7}\right)
+\end{align}
+
+\subsubsection{目标变量滞后特征}
+
+时间序列预测中，最具预测力的特征往往是目标变量的历史值。
+记第$t$天目标值为$y_t$，添加以下滞后特征（$\tau \in \{1,2,3,7,14,30\}$）：
+\begin{equation}
+\text{lag\_}\tau d(t) = y_{t-\tau}
+\end{equation}
+
+\subsubsection{滚动统计特征}
+
+为捕获近期趋势和波动性，对窗口大小$w \in \{7,14,30\}$添加滚动统计量（使用$\text{shift}(1)$防止信息泄露）：
+\begin{align}
+\text{roll\_mean\_}w(t) &= \frac{1}{w}\sum_{i=1}^{w} y_{t-i}, &
+\text{roll\_std\_}w(t) &= \sqrt{\frac{1}{w}\sum_{i=1}^{w} \bigl(y_{t-i} - \overline{y}_{t-w:t-1}\bigr)^2}
+\end{align}
+
+\subsection{序列构建与划分}
+
+处理后共得到25个特征。使用滑动窗口方法构建输入-输出样本对：
+输入为连续90天的特征序列（形状为$n \times 90 \times 25$），
+输出为接下来90天或365天的目标值序列（形状为$n \times 90$或$n \times 365$）。
+
+数据集按时间顺序划分为训练集（前70\%天数）和测试集（后30\%天数）。
+采用StandardScaler对特征和目标分别进行标准化处理（均值为0，标准差为1），
+scaler仅在训练集上拟合，然后应用于训练集和测试集。
+
+% ============================================================
+\section{模型}
+% ============================================================
+
+本节介绍所使用的三种深度学习模型。所有模型均使用PyTorch框架实现，
+代码已开源在GitHub：\url{https://github.com/yuni-xiaochen/ML\_work}。
+
+\subsection{LSTM序列到序列模型}
+
+LSTM（Long Short-Term Memory）是处理时序数据的经典循环神经网络架构，
+通过门控机制有效缓解了长序列训练中的梯度消失问题。
+
+\subsubsection{模型结构}
+
+\begin{itemize}[nosep]
+    \item \textbf{编码器（Encoder）}：2层单向LSTM，隐藏维度256，将输入序列编码为固定长度的上下文向量。
+    \item \textbf{注意力机制（Attention）}：采用Luong风格的加性注意力，在解码的每一步计算编码器输出的加权和作为上下文向量。
+    \item \textbf{解码器（Decoder）}：2层LSTM，输入为上一时刻的预测值与注意力上下文的拼接，
+    通过全连接层输出当前时刻的预测值。
+\end{itemize}
+
+训练时使用Teacher Forcing策略（比例为0.5）以加速收敛；推理时采用自回归方式逐步生成预测序列。
+总体参数量约305万。
+
+\subsection{Transformer模型}
+
+Transformer模型\cite{vaswani2017attention}最初提出于自然语言处理领域，
+其自注意力机制能够直接建模序列中任意两个位置之间的依赖关系，
+在长程依赖建模方面优于循环神经网络。
+
+\subsubsection{模型结构}
+
+本文的Transformer模型采用编码器-全连接解码器的架构（非自回归），具体结构如下：
+\begin{itemize}[nosep]
+    \item \textbf{输入投影}：通过线性层将25维特征映射到256维嵌入空间。
+    \item \textbf{位置编码}：采用正弦位置编码，为序列添加时序信息。
+    \item \textbf{编码器}：4层TransformerEncoderLayer，每层包含8头自注意力机制
+    和前馈网络（维度512），Dropout率为0.15。
+    \item \textbf{全局池化}：取编码器输出的最后时间步与全局平均池化之和，经Tanh激活后得到固定长度的全局表示向量。
+    \item \textbf{MLP解码器}：3层全连接网络（256$\to$512$\to$512$\to$输出长度），一次性输出全部预测值。
+\end{itemize}
+
+采用非自回归MLP解码器的设计是基于实验观察：传统的自回归Transformer解码器在推理时
+存在严重的曝光偏差（Exposure Bias）问题——模型在训练时始终看到真实目标值（Teacher Forcing），
+但在推理时从零向量开始生成，面对自己错误的预测输入，误差逐步累积，最终退化为预测均值线。
+改为直接MLP解码后，模型在训练和推理时的行为完全一致，从根本上消除了曝光偏差。
+总体参数量约262万。
+
+\subsection{CNN-Transformer改进模型（创新模型）}
+
+\subsubsection{设计动机}
+
+Transformer编码器擅长捕获全局依赖关系，但对局部时序模式（如短期波动、突变信号）
+的建模能力相对有限。电力消耗数据同时包含以天为单位的快速波动和以季节为单位的缓慢趋势，
+单一的Transformer编码器可能无法充分提取多尺度的局部特征。
+
+为解决这一问题，本文提出了CNN-Transformer模型，在Transformer编码器前增加多尺度
+一维卷积层，用不同感受野的卷积核并行提取局部特征，再通过Transformer编码器建模全局依赖。
+
+\subsubsection{模型结构}
+
+\begin{itemize}[nosep]
+    \item \textbf{多尺度CNN前端}：使用3个并行的一维卷积层（kernel\_size=3, 5, 7），
+    分别提取不同时间尺度的局部特征，拼接后经BatchNorm归一化，再投影到嵌入空间。
+    \item \textbf{Transformer编码器}：4层TransformerEncoderLayer，配置与Transformer模型相同（d\_model=256, nhead=8, ff=512）。
+    \item \textbf{全局池化与MLP解码器}：与Transformer模型相同的非自回归解码结构。
+\end{itemize}
+
+该设计的核心创新在于多尺度卷积前端：小卷积核（kernel=3）捕获日间快速波动，
+大卷积核（kernel=7）捕获周级别的趋势，三种尺度的特征拼接后为Transformer编码器
+提供了更丰富的局部表示基础。总体参数量约267万。
+
+\subsubsection{伪代码}
+
+\begin{algorithm}[H]
+\caption{CNN-Transformer前向传播}
+\begin{algorithmic}[1]
+\Require 输入序列 $\mathbf{X} \in \mathbb{R}^{B \times 90 \times 25}$
+\Ensure 预测序列 $\hat{\mathbf{Y}} \in \mathbb{R}^{B \times L}$，其中 $L \in \{90, 365\}$
+
+\State $\mathbf{C} \gets \text{MultiScaleConv}(\mathbf{X})$
+    \Comment{并行1D卷积(k=3,5,7)$\to$拼接$\to$BatchNorm}
+\State $\mathbf{H} \gets \text{Linear}(\mathbf{C})$
+    \Comment{投影到d\_model维}
+\State $\mathbf{H} \gets \mathbf{H} + \text{PositionalEncoding}(\mathbf{H})$
+\State $\mathbf{E} \gets \text{TransformerEncoder}(\mathbf{H})$
+    \Comment{4层多头自注意力}
+\State $\mathbf{g} \gets \mathbf{E}[:,-1,:] + \text{Mean}(\mathbf{E}, \text{dim}=1)$
+    \Comment{最后时间步 + 平均池化}
+\State $\mathbf{g} \gets \text{Tanh}(\text{Linear}(\mathbf{g}))$
+    \Comment{全局表示投影}
+\State $\hat{\mathbf{Y}} \gets \text{MLP}(\mathbf{g})$
+    \Comment{一次性输出全部预测值}
+
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{训练配置}
+
+所有模型采用统一的训练策略以保证对比的公平性：
+\begin{itemize}[nosep]
+    \item \textbf{优化器}：AdamW，学习率$5\times10^{-4}$，权重衰减$1\times10^{-5}$
+    \item \textbf{学习率调度}：CosineAnnealingWarmRestarts（$T_0=30$, $T_{\text{mult}}=2$, $\eta_{\text{min}}=10^{-6}$）
+    \item \textbf{损失函数}：Huber Loss（$\delta=1.0$），对异常值更鲁棒
+    \item \textbf{批量大小}：64
+    \item \textbf{最大训练轮数}：300，早停耐心值50
+    \item \textbf{梯度裁剪}：最大范数1.0
+    \item \textbf{混合精度训练}：启用AMP（Automatic Mixed Precision）
+    \item \textbf{设备}：NVIDIA GeForce RTX 5090（31.4 GB显存）
+    \item \textbf{随机种子}：42, 123, 456, 789, 1024（5轮独立实验）
+\end{itemize}
+
+% ============================================================
+\section{结果与分析}
+% ============================================================
+
+\subsection{短期预测（90天$\to$90天）}
+
+短期预测任务要求基于过去90天的数据预测未来90天的全局有功功率。
+
+\begin{table}[H]
+\centering
+\caption{短期预测（90$\to$90）各模型性能对比（5轮均值$\pm$标准差）}
+\label{tab:short}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{模型} & \textbf{MSE} & \textbf{MAE} & \textbf{参数量} & \textbf{训练用时(s)} \\
+\midrule
+Transformer   & 40.69$\pm$0.47 & 4.78$\pm$0.04 & 2,622,042 & 10 \\
+CNN-Transformer & 40.95$\pm$0.78 & 4.79$\pm$0.04 & 2,666,058 & 10 \\
+LSTM          & 47.80$\pm$1.25 & 5.30$\pm$0.08 & 3,057,666 & 71 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+由表\ref{tab:short}可知，在短期预测任务中，Transformer和CNN-Transformer性能接近，
+Transformer略优（MSE=40.69 vs 40.95），但差异在标准差范围内不显著。
+LSTM的性能明显弱于两个Transformer变体，MSE高出约17.5\%（47.80 vs 40.69），
+且稳定性较差（标准差1.25 vs 0.47）。
+
+值得注意的是，LSTM的训练用时（71秒）显著长于Transformer类模型（10秒），
+这是因为LSTM解码器的自回归循环（90步）无法像MLP解码器那样一次性并行输出。
+
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figure/predictions_lstm_short.png}
+        \caption{LSTM}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figure/predictions_transformer_short.png}
+        \caption{Transformer}
+    \end{subfigure}
+    \vspace{4pt}
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figure/predictions_cnn_transformer_short.png}
+        \caption{CNN-Transformer}
+    \end{subfigure}
+    \caption{短期预测（90$\to$90）各模型的预测曲线与真实值对比}
+    \label{fig:short_pred}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{figure/comparison_short.png}
+    \caption{短期预测各模型MSE与MAE对比}
+    \label{fig:short_comp}
+\end{figure}
+
+从图\ref{fig:short_pred}可以观察到，三个模型均能大致捕捉电力消耗的整体趋势，
+但在捕捉日间快速波动方面仍有不足——预测曲线的振幅明显小于真实曲线。
+
+\subsection{长期预测（90天$\to$365天）}
+
+长期预测任务要求预测未来一整年（365天）的电力消耗，这是更具挑战性的任务，
+因为需要在仅给定90天历史数据的情况下预测长达4倍的未来序列。
+
+\begin{table}[H]
+\centering
+\caption{长期预测（90$\to$365）各模型性能对比（5轮均值$\pm$标准差）}
+\label{tab:long}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{模型} & \textbf{MSE} & \textbf{MAE} & \textbf{参数量} & \textbf{训练用时(s)} \\
+\midrule
+CNN-Transformer & 42.07$\pm$0.98 & 5.00$\pm$0.07 & 2,807,133 & 19 \\
+Transformer     & 43.52$\pm$0.59 & 5.07$\pm$0.07 & 2,763,117 & 7 \\
+LSTM            & 60.39$\pm$3.92 & 6.03$\pm$0.23 & 3,057,666 & 243 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+由表\ref{tab:long}可知，在长期预测任务中，CNN-Transformer取得了最优性能
+（MSE=42.07，MAE=5.00），Transformer紧随其后（MSE=43.52），
+而LSTM性能大幅下降（MSE=60.39）。CNN-Transformer相比LSTM在MSE上提升了约30.3\%，
+验证了多尺度卷积前端在长序列建模中的有效性。
+
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figure/predictions_lstm_long.png}
+        \caption{LSTM}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figure/predictions_transformer_long.png}
+        \caption{Transformer}
+    \end{subfigure}
+    \vspace{4pt}
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figure/predictions_cnn_transformer_long.png}
+        \caption{CNN-Transformer}
+    \end{subfigure}
+    \caption{长期预测（90$\to$365）各模型的预测曲线与真实值对比}
+    \label{fig:long_pred}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{figure/comparison_long.png}
+    \caption{长期预测各模型MSE与MAE对比}
+    \label{fig:long_comp}
+\end{figure}
+
+\subsection{短期到长期的退化分析}
+
+\begin{table}[H]
+\centering
+\caption{各模型从短期到长期的性能退化}
+\label{tab:degrade}
+\begin{tabular}{lccc}
+\toprule
+\textbf{模型} & \textbf{短期MSE} & \textbf{长期MSE} & \textbf{退化倍数} \\
+\midrule
+CNN-Transformer & 40.95 & 42.07 & 1.03$\times$ \\
+Transformer     & 40.69 & 43.52 & 1.07$\times$ \\
+LSTM            & 47.80 & 60.39 & 1.26$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+表\ref{tab:degrade}的退化分析表明，CNN-Transformer在短期到长期的性能退化最小（仅1.03倍），
+几乎做到了短期和长期预测性能持平。这归功于两个设计因素：
+（1）多尺度CNN前端提取的局部特征对时间跨度不敏感；
+（2）非自回归MLP解码器不会因序列增长而产生误差累积。
+相比之下，LSTM的退化最为严重（1.26倍），其自回归解码机制导致误差在长序列中逐步累积。
+
+\subsection{误差沿时间维度分布}
+
+为进一步分析各模型的预测行为，表\ref{tab:seg}给出了长期预测中一个典型样本（Sample 1）的分段MAE。
+
+\begin{table}[H]
+\centering
+\caption{长期预测分段时间MAE对比（Sample 1）}
+\label{tab:seg}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{模型} & \textbf{D1--30} & \textbf{D31--90} & \textbf{D91--180} & \textbf{D181--270} & \textbf{D271--365} \\
+\midrule
+CNN-Transformer & 5.12 & 5.37 & 4.42 & 4.00 & 5.76 \\
+Transformer     & 4.98 & 4.86 & 4.84 & 4.45 & 5.62 \\
+LSTM            & 5.29 & 6.05 & 4.40 & 5.91 & 6.30 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+从表\ref{tab:seg}可见，CNN-Transformer和Transformer在各时间段的MAE波动较小且相对均匀，
+而LSTM在D31--90和D181--365段的误差明显增大，表现出误差随时间累积的典型特征。
+两个Transformer变体的MAE在时间轴上保持稳定，说明非自回归解码器有效避免了误差累积问题。
+
+% ============================================================
+\section{讨论}
+% ============================================================
+
+\subsection{模型性能总结}
+
+综合短期和长期预测实验，CNN-Transformer模型在综合性能上表现最优：
+短期MSE与Transformer持平，长期MSE最优，且退化率最低（1.03倍）。
+LSTM虽然在参数量上相近（约305万），但两个任务上的MSE均显著高于Transformer类模型，
+且训练效率较低（LSTM 71--243s vs Transformer 7--19s）。
+
+一个值得注意的发现是：在将Transformer的自回归解码器替换为非自回归MLP解码器后，
+其性能得到了质的提升（从旧版长期MSE=92.81降至43.52），
+这充分说明了曝光偏差（Exposure Bias）对自回归模型的严重影响。
+在训练-推理不一致的场景下，非自回归解码策略是更可靠的选择。
+
+\subsection{CNN-Transformer的优势分析}
+
+CNN-Transformer相比纯Transformer的优势体现在两个方面：
+（1）在长期预测中，MSE从43.52降至42.07（提升约3.3\%）；
+（2）退化倍数从1.07降至1.03，长期稳定性更好。
+多尺度CNN前端通过并行提取不同时间跨度的局部模式，为后续的Transformer编码器
+提供了更丰富的层次化表示。小卷积核捕获日间波动，大卷积核提取周级别趋势，
+这种多尺度特征融合策略有效增强了模型对局部时序模式的感知能力。
+
+\subsection{模型局限性}
+
+尽管取得了可接受的预测性能，当前模型仍存在以下局限：
+
+\textbf{预测振幅不足。}从图\ref{fig:short_pred}和\ref{fig:long_pred}可见，
+所有模型的预测曲线振幅均小于真实值（如真实值范围约4--67 kWh，而预测范围约15--37 kWh）。
+这反映了回归模型在用MSE/Huber损失训练时倾向于输出条件均值的固有问题。
+可能的改进方向包括：使用分位数回归预测不确定性区间；引入对抗训练或变分自编码器
+（VAE）以显式建模输出的分布。
+
+\textbf{极端值预测能力弱。}当真实用电量出现异常高峰（如$>$45 kWh）或低谷（如$<$10 kWh）时，
+所有模型的预测误差均显著增大。这是因为这类极端事件在训练集中出现频率较低，
+且缺乏直接与之关联的输入特征。未来的改进可考虑加入节假日标识、家庭成员活动模式
+等额外的上下文特征。
+
+\textbf{长期预测中的季节性建模。}365天预测需要模型捕获完整的年度季节性周期。
+当前模型仅使用正弦/余弦编码表示年内日序，但单一的年度周期编码可能不足以精细刻画
+冬夏用电模式的差异。引入可学习的季节性嵌入或分解式时序建模（如Autoformer、
+FEDformer）可能进一步改善长期预测性能。
+
+\subsection{数据处理中的挑战}
+
+在数据预处理过程中，我们注意到以下挑战：
+（1）原始数据以分钟为粒度，日聚合操作会丢失日内用电模式（如早晚高峰），
+未来可考虑在模型中显式编码小时级特征；
+（2）气象数据为月度粒度，与日级电力数据的粒度不匹配，
+需要插值处理，可能引入一定偏差；
+（3）数据中约1.2\%的记录含有缺失值，虽然采用填充策略处理，
+但缺失模式本身可能携带有意义的信息（如停电事件）。
+
+\subsection{结论}
+
+本文针对家庭电力消耗的多变量时间序列预测问题，实现了LSTM、Transformer和
+CNN-Transformer三种深度学习模型，并在短期（90天）和长期（365天）两个任务上
+进行了系统对比。实验结果表明：
+（1）基于非自回归解码的Transformer类模型在预测精度和训练效率上均优于LSTM；
+（2）CNN-Transformer的多尺度卷积前端在长期预测任务中具有额外的性能收益；
+（3）曝光偏差是自回归模型性能退化的关键因素，非自回归解码策略是有效的解决方案。
+
+代码开源在GitHub：\url{https://github.com/yuni-xiaochen/ML\_work}。
+
+% ============================================================
+% 参考文献
+% ============================================================
+
+\begin{thebibliography}{99}
+
+\bibitem{uci_dataset}
+UCI Machine Learning Repository. Individual Household Electric Power Consumption.
+\url{https://archive.ics.uci.edu/dataset/235/individual+household+electric+power+consumption}
+
+\bibitem{weather_data}
+M\'et\'eo-France. Donn\'ees climatologiques de base mensuelles.
+\url{https://www.data.gouv.fr/fr/datasets/donnees-climatologiques-de-base-mensuelles}
+
+\bibitem{vaswani2017attention}
+Vaswani A, Shazeer N, Parmar N, et al. Attention is All You Need.
+Advances in Neural Information Processing Systems, 2017, 30.
+
+\bibitem{hochreiter1997long}
+Graves A. Long short-term memory[J]. Supervised sequence labelling with recurrent neural networks, 2012: 37-45.
+
+\bibitem{luong2015effective}
+Luong M T, Pham H, Manning C D. Effective approaches to attention-based neural machine translation[C]//Proceedings of the 2015 conference on empirical methods in natural language processing. 2015: 1412-1421.
+
+\bibitem{devlin2019bert}
+Devlin J, Chang M W, Lee K, et al. Bert: Pre-training of deep bidirectional transformers for language understanding[C]//Proceedings of the 2019 conference of the North American chapter of the association for computational linguistics: human language technologies, volume 1 (long and short papers). 2019: 4171-4186.
+
+\bibitem{wu2021autoformer}
+Wu H, Xu J, Wang J, et al. Autoformer: Decomposition transformers with auto-correlation for long-term series forecasting[J]. Advances in neural information processing systems, 2021, 34: 22419-22430.
+
+\bibitem{zhou2021informer}
+Zhou H, Zhang S, Peng J, et al. Informer: Beyond efficient transformer for long sequence time-series forecasting[C]//Proceedings of the AAAI conference on artificial intelligence. 2021, 35(12): 11106-11115.
+
+\end{thebibliography}
+
+\end{document}

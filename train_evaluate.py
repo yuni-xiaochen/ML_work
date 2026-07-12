@@ -11,6 +11,12 @@ from models import create_model
 from tqdm import tqdm
 import time
 
+# GPU 性能优化
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True       # 自动寻找最优卷积算法
+    torch.backends.cuda.matmul.allow_tf32 = True  # 5090 支持 TF32 加速
+    torch.backends.cudnn.allow_tf32 = True
+
 
 def set_seed(seed):
     """设置随机种子"""
@@ -21,29 +27,35 @@ def set_seed(seed):
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device,
-                teacher_forcing_ratio, output_len, pbar=None):
+                teacher_forcing_ratio, output_len, scaler=None, pbar=None):
     """训练一个epoch"""
     model.train()
     total_loss = 0.0
     n_batches = 0
 
     for batch_X, batch_y in dataloader:
-        batch_X = batch_X.to(device)
-        batch_y = batch_y.to(device)
+        batch_X = batch_X.to(device, non_blocking=True)
+        batch_y = batch_y.to(device, non_blocking=True)
 
         optimizer.zero_grad()
 
-        predictions = model(batch_X, target_seq=batch_y,
-                            teacher_forcing_ratio=teacher_forcing_ratio,
-                            output_len=output_len)
+        # AMP 混合精度：前向用 autocast
+        with torch.cuda.amp.autocast(enabled=(scaler is not None)):
+            predictions = model(batch_X, target_seq=batch_y,
+                                teacher_forcing_ratio=teacher_forcing_ratio,
+                                output_len=output_len)
+            loss = criterion(predictions, batch_y)
 
-        loss = criterion(predictions, batch_y)
-        loss.backward()
-
-        # 梯度裁剪
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         total_loss += loss.item()
         n_batches += 1
@@ -64,10 +76,8 @@ def evaluate(model, dataloader, criterion, device, output_len, scaler_y=None):
     all_targets = []
 
     for batch_X, batch_y in dataloader:
-        batch_X = batch_X.to(device)
-        batch_y = batch_y.to(device)
-
-        # 推理时不使用teacher forcing
+        batch_X = batch_X.to(device, non_blocking=True)
+        batch_y = batch_y.to(device, non_blocking=True)
         predictions = model(batch_X, target_seq=None,
                             teacher_forcing_ratio=0.0,
                             output_len=output_len)
@@ -141,16 +151,24 @@ def train_model(model, X_train, y_train, X_test, y_test, scaler_y,
     test_dataset = TensorDataset(
         torch.FloatTensor(X_test), torch.FloatTensor(y_test))
 
+    num_workers = 4 if device == 'cuda' else 0
     train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                               shuffle=True, drop_last=False)
+                              shuffle=True, drop_last=False,
+                              num_workers=num_workers, pin_memory=(device == 'cuda'))
     test_loader = DataLoader(test_dataset, batch_size=batch_size,
-                              shuffle=False, drop_last=False)
+                             shuffle=False, drop_last=False,
+                             num_workers=num_workers, pin_memory=(device == 'cuda'))
 
     # 优化器和损失函数
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10)
-    criterion = nn.MSELoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    # CosineAnnealingWarmRestarts: 周期性重启，跳出局部最优
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=30, T_mult=2, eta_min=1e-6)
+    # Huber loss: 对异常值更鲁棒，避免被少数极端日主导
+    criterion = nn.HuberLoss(delta=1.0)
+
+    # AMP GradScaler (仅 CUDA)
+    scaler = torch.cuda.amp.GradScaler() if device == 'cuda' else None
 
     # 训练
     best_val_loss = float('inf')
@@ -169,7 +187,7 @@ def train_model(model, X_train, y_train, X_test, y_test, scaler_y,
         train_pbar = epoch_pbar if hasattr(epoch_pbar, 'set_postfix') else None
         train_loss = train_epoch(model, train_loader, optimizer, criterion,
                                  device, teacher_forcing_ratio, output_len,
-                                 pbar=train_pbar)
+                                 scaler=scaler, pbar=train_pbar)
         history['train_loss'].append(train_loss)
 
         # 验证
@@ -178,8 +196,8 @@ def train_model(model, X_train, y_train, X_test, y_test, scaler_y,
         val_loss = val_results['loss']
         history['val_loss'].append(val_loss)
 
-        # 学习率调度
-        scheduler.step(val_loss)
+        # 学习率调度 (CosineAnnealing 按 epoch 自动更新)
+        scheduler.step()
 
         # 更新进度条描述
         if verbose:
@@ -286,11 +304,11 @@ def run_experiment(model_name, X_train, y_train, X_test, y_test, scaler_y,
         result = train_model(
             model, X_train, y_train, X_test, y_test, scaler_y,
             output_len=output_len,
-            batch_size=kwargs.get('batch_size', 32),
-            epochs=kwargs.get('epochs', 200),
-            lr=kwargs.get('lr', 0.001),
+            batch_size=kwargs.get('batch_size', 64),
+            epochs=kwargs.get('epochs', 300),
+            lr=kwargs.get('lr', 0.0005),
             teacher_forcing_ratio=kwargs.get('teacher_forcing_ratio', 0.5),
-            patience=kwargs.get('patience', 20),
+            patience=kwargs.get('patience', 50),
             device=device,
             verbose=True)
 

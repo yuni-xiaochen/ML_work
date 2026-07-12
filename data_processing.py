@@ -209,6 +209,23 @@ def add_time_features(df):
     return df
 
 
+def add_target_lag_features(df, target_col, lag_days=(1, 2, 3, 7, 14, 30)):
+    """添加目标变量的滞后特征 — 最关键的特征工程"""
+    for lag in lag_days:
+        df[f'{target_col}_lag_{lag}d'] = df[target_col].shift(lag)
+    return df
+
+
+def add_rolling_features(df, target_col, windows=(7, 14, 30)):
+    """添加目标变量的滚动统计量"""
+    for w in windows:
+        df[f'{target_col}_roll_mean_{w}d'] = (
+            df[target_col].shift(1).rolling(w).mean())
+        df[f'{target_col}_roll_std_{w}d'] = (
+            df[target_col].shift(1).rolling(w).std())
+    return df
+
+
 # ============================================================
 # 4. 序列构建
 # ============================================================
@@ -289,18 +306,37 @@ def process_all(power_path, weather_path, input_len=90,
     print(f"  天气数据月份数: {len(weather_monthly)}")
 
     # 5. 特征工程
-    print("\n[5/6] 特征工程...")
+    print("\n[5/7] 特征工程...")
     daily = add_time_features(daily)
 
     # 定义特征和目标
-    feature_cols = [
+    target_col = 'Global_active_power'
+    base_feature_cols = [
         'Global_reactive_power', 'Voltage', 'Global_intensity',
         'Sub_metering_1', 'Sub_metering_2', 'Sub_metering_3',
         'Sub_metering_remainder',
         'RR', 'NBJRR1', 'NBJRR5', 'NBJRR10', 'NBJBROU',
         'sin_dayofyear', 'cos_dayofyear', 'sin_dayofweek', 'cos_dayofweek'
     ]
-    target_col = 'Global_active_power'
+
+    # 5b. 目标滞后 + 滚动统计（最关键的特征！）
+    print("\n[6/7] 添加目标滞后与滚动特征...")
+    daily = add_target_lag_features(daily, target_col)
+    daily = add_rolling_features(daily, target_col)
+
+    # 构建完整特征列表
+    lag_cols = [f'{target_col}_lag_{d}d' for d in (1, 2, 3, 7, 14, 30)]
+    roll_cols = []
+    for w in (7, 14, 30):
+        roll_cols.append(f'{target_col}_roll_mean_{w}d')
+        roll_cols.append(f'{target_col}_roll_std_{w}d')
+    feature_cols = base_feature_cols + lag_cols + roll_cols
+
+    # 删除滞后产生的 NaN 行（前30天）
+    daily = daily.dropna(subset=lag_cols + roll_cols).reset_index(drop=True)
+    print(f"  添加滞后+滚动特征后: {len(daily)} 天 (删除了前30天NaN)")
+    print(f"  特征总数: {len(feature_cols)} (基础{len(base_feature_cols)} + 滞后{len(lag_cols)} + 滚动{len(roll_cols)})")
+    print(f"  目标: {target_col}")
 
     # 检查缺失值
     all_cols = feature_cols + [target_col]
@@ -309,11 +345,8 @@ def process_all(power_path, weather_path, input_len=90,
         print(f"  警告: {n_missing} 个缺失值，进行填充...")
         daily[all_cols] = daily[all_cols].ffill().bfill().fillna(0)
 
-    print(f"  特征数: {len(feature_cols)}")
-    print(f"  目标: {target_col}")
-
-    # 6. 数据划分与序列构建
-    print("\n[6/6] 数据划分与序列构建...")
+    # 7. 数据划分与序列构建
+    print("\n[7/7] 数据划分与序列构建...")
 
     # 按时间顺序划分，确保测试集至少有 max(input_len + output_len) 天
     n_total = len(daily)

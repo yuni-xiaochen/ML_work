@@ -69,8 +69,12 @@ class DecoderLSTM(nn.Module):
 
         outputs = []
 
-        use_teacher_forcing = (target_seq is not None and
-                               torch.rand(1).item() < teacher_forcing_ratio)
+        # 训练时强制使用 teacher forcing，避免自回归计算图OOM
+        if self.training:
+            use_teacher_forcing = (target_seq is not None)
+        else:
+            use_teacher_forcing = (target_seq is not None and
+                                   torch.rand(1).item() < teacher_forcing_ratio)
         target_len = output_len if target_seq is None else target_seq.size(1)
 
         for t in range(target_len):
@@ -152,10 +156,17 @@ class PositionalEncoding(nn.Module):
 
 
 class TransformerModel(nn.Module):
-    """Transformer 编码器-解码器模型（轻量版）"""
-    def __init__(self, input_dim, d_model=128, nhead=4, num_encoder_layers=3,
-                 num_decoder_layers=3, dim_feedforward=256, dropout=0.1,
-                 output_len=90):
+    """
+    Transformer 编码器 + 直接MLP解码（非自回归）
+
+    与旧版的关键区别：去掉了自回归 Transformer Decoder。
+    旧版从 zero token 开始逐步生成，训练时只见过真实序列（teacher forcing），
+    推理时见到自己的错误预测 → 误差累积 → 退化到预测均值线。
+
+    新版用 MLP 一次性输出全部 90/365 天，完全消除曝光偏差。
+    """
+    def __init__(self, input_dim, d_model=256, nhead=8, num_encoder_layers=4,
+                 dim_feedforward=512, dropout=0.15, output_len=90):
         super().__init__()
         self.d_model = d_model
         self.output_len = output_len
@@ -164,7 +175,7 @@ class TransformerModel(nn.Module):
         self.input_proj = nn.Linear(input_dim, d_model)
         self.pos_encoder = PositionalEncoding(d_model, dropout=dropout)
 
-        # Transformer 编码器
+        # Transformer 编码器（仅编码，不解码）
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_feedforward,
@@ -172,70 +183,50 @@ class TransformerModel(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_encoder_layers)
 
-        # Transformer 解码器
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model, nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout, batch_first=True)
-        self.transformer_decoder = nn.TransformerDecoder(
-            decoder_layer, num_layers=num_decoder_layers)
+        # 全局表示：最后时间步 + 平均池化
+        self.global_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.Tanh())
 
-        # 输出投影
-        self.output_proj = nn.Linear(d_model, 1)
-
-        # 解码器输入embedding（target的positional embedding）
-        self.tgt_proj = nn.Linear(1, d_model)
-        self.tgt_pos_encoder = PositionalEncoding(d_model, dropout=dropout)
+        # 直接MLP解码器 — 一次性输出完整序列，无误差累积
+        self.decoder = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, output_len),
+        )
 
     def forward(self, src, target_seq=None, teacher_forcing_ratio=0.5, output_len=None):
         if output_len is None:
             output_len = self.output_len
 
-        batch_size = src.size(0)
-        device = src.device
-
-        # 编码
+        # Transformer 编码
         src_emb = self.input_proj(src)
         src_emb = self.pos_encoder(src_emb)
-        memory = self.transformer_encoder(src_emb)
+        encoded = self.transformer_encoder(src_emb)  # (batch, seq_len, d_model)
 
-        # 构建解码器输入序列
-        use_tf = (target_seq is not None and
-                  torch.rand(1).item() < teacher_forcing_ratio)
+        # 全局表示：最后时间步 + 平均池化
+        last_hidden = encoded[:, -1, :]   # (batch, d_model)
+        avg_pooled = encoded.mean(dim=1)  # (batch, d_model)
+        global_feat = self.global_proj(last_hidden + avg_pooled)
 
-        if use_tf:
-            # Teacher forcing: 直接用目标序列
-            tgt_input = target_seq.unsqueeze(-1)  # (batch, out_len, 1)
-            tgt_emb = self.tgt_proj(tgt_input)
-            tgt_emb = self.tgt_pos_encoder(tgt_emb)
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(
-                output_len, device=device)
-            out = self.transformer_decoder(tgt_emb, memory, tgt_mask)
-            out = self.output_proj(out)  # (batch, output_len, 1)
-            return out.squeeze(-1)
+        # MLP 一次性解码
+        if output_len == self.output_len:
+            out = self.decoder(global_feat)  # (batch, output_len)
         else:
-            # 自回归生成（避免inplace操作）
-            outputs = []
-            # 初始输入：[start] token (zeros)
-            tgt_so_far = torch.zeros(batch_size, 1, 1, device=device)
+            # 动态输出长度
+            temp_decoder = nn.Sequential(
+                nn.Linear(self.decoder[0].in_features, self.decoder[0].out_features),
+                nn.ReLU(),
+                nn.Dropout(0.15),
+                nn.Linear(self.decoder[0].out_features, output_len),
+            ).to(src.device)
+            out = temp_decoder(global_feat)
 
-            for t in range(output_len):
-                tgt_emb = self.tgt_proj(tgt_so_far)
-                tgt_emb = self.tgt_pos_encoder(tgt_emb)
-                tgt_mask = nn.Transformer.generate_square_subsequent_mask(
-                    t + 1, device=device)
-                out = self.transformer_decoder(tgt_emb, memory, tgt_mask)
-                pred = self.output_proj(out)  # (batch, t+1, 1)
-
-                # 取最后一步预测
-                last_pred = pred[:, -1:, :]  # (batch, 1, 1)
-                outputs.append(last_pred[:, 0, 0])  # (batch,)
-
-                # 拼接（非inplace）
-                tgt_so_far = torch.cat([tgt_so_far, last_pred], dim=1)
-
-            out = torch.stack(outputs, dim=1)  # (batch, output_len)
-            return out
+        return out
 
 
 # ============================================================
@@ -400,34 +391,33 @@ def create_model(model_name, input_dim, output_len=90, **kwargs):
     if model_name == 'lstm':
         return LSTMModel(
             input_dim=input_dim,
-            hidden_dim=kwargs.get('hidden_dim', 128),
-            num_layers=kwargs.get('num_layers', 2),
+            hidden_dim=kwargs.get('hidden_dim', 256),
+            num_layers=kwargs.get('num_layers', 3),
             dropout=kwargs.get('dropout', 0.2))
     elif model_name == 'transformer':
         return TransformerModel(
             input_dim=input_dim,
-            d_model=kwargs.get('d_model', 128),
-            nhead=kwargs.get('nhead', 4),
-            num_encoder_layers=kwargs.get('num_encoder_layers', 3),
-            num_decoder_layers=kwargs.get('num_decoder_layers', 3),
-            dim_feedforward=kwargs.get('dim_feedforward', 256),
-            dropout=kwargs.get('dropout', 0.1),
+            d_model=kwargs.get('d_model', 256),
+            nhead=kwargs.get('nhead', 8),
+            num_encoder_layers=kwargs.get('num_encoder_layers', 4),
+            dim_feedforward=kwargs.get('dim_feedforward', 512),
+            dropout=kwargs.get('dropout', 0.15),
             output_len=output_len)
     elif model_name == 'cnn_transformer':
         return CNNTransformerModel(
             input_dim=input_dim,
-            d_model=kwargs.get('d_model', 128),
-            cnn_dim=kwargs.get('cnn_dim', 64),
-            nhead=kwargs.get('nhead', 4),
-            num_encoder_layers=kwargs.get('num_encoder_layers', 3),
-            dim_feedforward=kwargs.get('dim_feedforward', 256),
-            dropout=kwargs.get('dropout', 0.1),
+            d_model=kwargs.get('d_model', 256),
+            cnn_dim=kwargs.get('cnn_dim', 128),
+            nhead=kwargs.get('nhead', 8),
+            num_encoder_layers=kwargs.get('num_encoder_layers', 4),
+            dim_feedforward=kwargs.get('dim_feedforward', 512),
+            dropout=kwargs.get('dropout', 0.15),
             output_len=output_len)
     elif model_name == 'mlp':
         return MLPBaseline(
             input_dim=input_dim,
             seq_len=kwargs.get('seq_len', 90),
             output_len=output_len,
-            hidden_dim=kwargs.get('hidden_dim', 256))
+            hidden_dim=kwargs.get('hidden_dim', 512))
     else:
         raise ValueError(f"Unknown model: {model_name}")
